@@ -127,6 +127,19 @@ class ClaudeMCPAgent:
                     "type": "enabled",
                     "budget_tokens": self.thinking_budget_tokens,
                 }
+            payload_preview = {
+                "model": self.model,
+                "system": system_content,
+                "messages": conversation,
+                "tools": tools,
+                "max_tokens": self.max_output_tokens,
+                "temperature": self.temperature,
+                "thinking": request_kwargs.get("thinking"),
+            }
+            logger.info(
+                "Sending request to Anthropic (counts toward input tokens; preview truncated): %s",
+                json.dumps(payload_preview, default=str)[:5000],
+            )
 
             tool_requests: List[Any] = []
             async with self.client.messages.stream(**request_kwargs) as stream:
@@ -173,6 +186,32 @@ class ClaudeMCPAgent:
                             yield {"delta": {"tool_calls": [tool_call]}}
 
                 final_message = await stream.get_final_message()
+                response_preview = {"role": "assistant", "content": final_message.content}
+                try:
+                    response_dump = json.dumps(response_preview, default=str)
+                except TypeError:
+                    response_dump = str(response_preview)
+                logger.info(
+                    "Received response from Anthropic (counts toward output tokens; preview truncated): %s",
+                    response_dump[:5000],
+                )
+                usage = getattr(final_message, "usage", None)
+                if usage:
+                    input_tokens = getattr(usage, "input_tokens", None)
+                    output_tokens = getattr(usage, "output_tokens", None)
+                    total_tokens = (
+                        input_tokens + output_tokens
+                        if input_tokens is not None and output_tokens is not None
+                        else None
+                    )
+                    logger.info(
+                        "Token usage: input=%s output=%s total=%s cache_creation_input=%s cache_read_input=%s",
+                        input_tokens,
+                        output_tokens,
+                        total_tokens,
+                        getattr(usage, "cache_creation_input_tokens", None),
+                        getattr(usage, "cache_read_input_tokens", None),
+                    )
                 conversation.append({"role": "assistant", "content": final_message.content})
 
                 text_blocks = [
