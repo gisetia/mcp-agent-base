@@ -25,6 +25,7 @@ Minimal FastAPI service that exposes an OpenAI-compatible `/chat/completions` en
   - `messages`: list of `{role, content}` (required).
   - `stream`: bool, default `true` (controls SSE vs one-shot JSON).
   - `simulate`: optional bool to override the `SIMULATE` env var for a single request.
+- `include_model_info`: bool, default `false` (attach model settings + usage stats to the response).
 - Ignored params: model, temperature, max_tokens, top_p, presence_penalty, frequency_penalty, stop, tools, tool_choice, and other OpenAI fields.
 
 Non-streaming example:
@@ -41,7 +42,7 @@ curl -N -X POST http://localhost:5000/chat/completions \
   -d '{"messages":[{"role":"user","content":"hello"}],"stream":true}'
 ```
 
-Streaming yields OpenAI-shaped `chat.completion.chunk` events for assistant text, tool calls, and tool results, followed by `data: [DONE]`.
+Streaming yields OpenAI-shaped `chat.completion.chunk` events for assistant text, tool calls, and tool results, followed by `data: [DONE]`. When `include_model_info=true`, the final chunk includes a `model_info` object, and structured deltas (such as `tool_calls` and `finish_reason`) pass through in the SSE payloads.
 
 ## Simulation mode
 - Set `SIMULATE=true` to bypass Anthropic and MCP entirely and return the canned string `Simulated response.` (streaming still emits OpenAI-style chunks). Useful for local testing without secrets or MCP server access.
@@ -63,3 +64,4 @@ Streaming yields OpenAI-shaped `chat.completion.chunk` events for assistant text
 ## Notes
 - MCP tools are discovered at request time; make sure `MCP_SERVER_URL` is reachable.
 - When `THINKING_ENABLED=true`, the agent forwards a thinking budget to Claude.
+- The service retries transient MCP/LLM connection failures with backoff before returning an error.
