@@ -52,3 +52,35 @@ async def test_async_sse_chat_completions_handles_preformed_chunks():
     passthrough_payload = json.loads(payload_lines[1].split("data: ", 1)[1])
     assert passthrough_payload["choices"][0]["finish_reason"] == "stop"
     assert payload_lines[-1] == "data: [DONE]"
+
+
+@pytest.mark.asyncio
+async def test_async_sse_chat_completions_passes_tool_calls_and_model_info():
+    async def gen():
+        yield {
+            "delta": {
+                "tool_calls": [
+                    {
+                        "id": "tool-1",
+                        "type": "function",
+                        "function": {"name": "demo", "arguments": "{}"},
+                    }
+                ]
+            },
+            "finish_reason": None,
+            "model_info": {"usage": {"input_tokens": 1}},
+        }
+        yield {"delta": {}, "finish_reason": "stop", "model_info": {"usage": {"input_tokens": 1}}}
+
+    payload_lines = []
+    async for chunk in async_sse_chat_completions(gen(), "model-async"):
+        payload_lines.append(chunk.strip())
+
+    first_payload = json.loads(payload_lines[0].split("data: ", 1)[1])
+    assert first_payload["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "demo"
+    assert first_payload["model_info"]["usage"]["input_tokens"] == 1
+
+    second_payload = json.loads(payload_lines[1].split("data: ", 1)[1])
+    assert second_payload["choices"][0]["finish_reason"] == "stop"
+    assert second_payload["model_info"]["usage"]["input_tokens"] == 1
+    assert payload_lines[-1] == "data: [DONE]"
