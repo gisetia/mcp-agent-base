@@ -65,3 +65,22 @@ Streaming yields OpenAI-shaped `chat.completion.chunk` events for assistant text
 - MCP tools are discovered at request time; make sure `MCP_SERVER_URL` is reachable.
 - When `THINKING_ENABLED=true`, the agent forwards a thinking budget to Claude.
 - The service retries transient MCP/LLM connection failures with backoff before returning an error.
+
+
+## Connecting to LibreChat
+
+Connect the agent to LibreChat as an OpenAI-compatible custom endpoint by adding the following to your `librechat.yaml`:
+
+```yaml
+endpoints:
+  custom:
+    - name: "<agent-name>"
+      apiKey: "none"
+      baseURL: "http://<host>:<port>"
+      models:
+        default: ["<agent-name>"]
+      titleConvo: true
+      titleModel: "<agent-name>"
+      modelDisplayLabel: "<agent-name>"
+```
+Set `baseURL` to `http://<host>:<port>` using the same host and port where this agent runs. The `<agent-name>` is arbitrary and will define how the endpoint is displayed in LibreChat.
