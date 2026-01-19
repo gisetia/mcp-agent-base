@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import json
@@ -33,6 +34,28 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("mcp.client.streamable_http").setLevel(logging.WARNING)
 logging.getLogger("mcp.client").setLevel(logging.WARNING)
 
+try:  # Optional imports for more specific error handling.
+    from anthropic import APIConnectionError, APITimeoutError, APIStatusError  # type: ignore
+except Exception:  # pragma: no cover - defensive import for older anthropic versions
+    APIConnectionError = None
+    APITimeoutError = None
+    APIStatusError = None
+
+try:  # Optional dependency; used only for error matching.
+    import httpcore  # type: ignore
+    import httpx  # type: ignore
+except Exception:  # pragma: no cover - fallback if httpx isn't available
+    httpcore = None
+    httpx = None
+
+
+def _iter_exceptions(exc: BaseException):
+    if isinstance(exc, BaseExceptionGroup):
+        for nested in exc.exceptions:
+            yield from _iter_exceptions(nested)
+    else:
+        yield exc
+
 
 class ClaudeMCPAgent:
     """Runs a Claude tool-use loop backed by the MCP server."""
@@ -49,6 +72,8 @@ class ClaudeMCPAgent:
         thinking_budget_tokens: Optional[int] = DEFAULT_THINKING_BUDGET_TOKENS,
         simulate: bool = SIMULATE,
         mock_empty_mcp: Optional[bool] = None,
+        llm_max_retries: int = 3,
+        llm_retry_backoff_seconds: float = 0.5,
     ):
         self.model = self._normalize_model(model)
         self.max_output_tokens = max_output_tokens
@@ -75,6 +100,32 @@ class ClaudeMCPAgent:
             self.mcp_client = EmptyMCPClient()
         else:
             self.mcp_client = MCPClient(mcp_server_url)
+        self._llm_max_retries = max(1, llm_max_retries)
+        self._llm_retry_backoff_seconds = max(0.0, llm_retry_backoff_seconds)
+
+    def _is_llm_connection_error(self, exc: BaseException) -> bool:
+        for err in _iter_exceptions(exc):
+            if APIConnectionError is not None and isinstance(err, APIConnectionError):
+                return True
+            if APITimeoutError is not None and isinstance(err, APITimeoutError):
+                return True
+            if APIStatusError is not None and isinstance(err, APIStatusError):
+                status = getattr(err, "status_code", None) or getattr(
+                    getattr(err, "response", None), "status_code", None
+                )
+                if status is not None and int(status) >= 500:
+                    return True
+            if isinstance(err, (ConnectionError, TimeoutError, asyncio.TimeoutError)):
+                return True
+            if httpx is not None and isinstance(
+                err, (httpx.ConnectError, httpx.ReadTimeout, httpx.TimeoutException)
+            ):
+                return True
+            if httpcore is not None and isinstance(
+                err, (httpcore.ConnectError, httpcore.ReadTimeout, httpcore.TimeoutException)
+            ):
+                return True
+        return False
 
     async def ask_stream(
         self,
@@ -155,94 +206,138 @@ class ClaudeMCPAgent:
             )
 
             tool_requests: List[Any] = []
-            async with self.client.messages.stream(**request_kwargs) as stream:
-                async for event in stream:
-                    if event.type == "content_block_start":
-                        block_types[event.index] = getattr(event.content_block, "type", None)
-                        if block_types.get(event.index) == "thinking" and stream_mode:
-                            yield {"delta": {"content": "**Thoughts:**\n"}}
-                    if event.type == "content_block_delta":
-                        # Anthropic thinking deltas may not always use type="text_delta"; look for a text attribute.
-                        delta_text = getattr(event.delta, "text", None) or ""
-                        if not delta_text and hasattr(event.delta, "thinking"):
-                            delta_text = getattr(event.delta, "thinking") or ""
-                        if delta_text:
-                            block_type = block_types.get(event.index)
-                            is_thinking = (
-                                block_type == "thinking"
-                                or hasattr(event.delta, "thinking")
-                                or getattr(event.delta, "type", None) == "thinking_delta"
-                            )
-                            if is_thinking:
-                                thinking_parts.append(delta_text)
-                                if stream_mode:
-                                    yield {"delta": {"thinking": delta_text, "content": delta_text}}
-                            else:
-                                if stream_mode:
-                                    yield {"delta": {"content": delta_text}}
-                    if event.type == "content_block_stop" and stream_mode:
-                        if block_types.get(event.index) == "thinking":
-                            yield {"delta": {"content": "\n\n---\n\n"}}
-                        yield {"delta": {"content": "\n"}}
-                        
-                    if event.type == "content_block_stop" and getattr(event.content_block, "type", None) == "tool_use":
-                        tool_requests.append(event.content_block)
-                        if stream_mode:
-                            tool_call = {
-                                "id": event.content_block.id,
-                                "type": "function",
-                                "function": {
-                                    "name": event.content_block.name,
-                                    "arguments": json.dumps(event.content_block.input or {}),
-                                },
-                            }
-                            yield {"delta": {"tool_calls": [tool_call]}}
-
-                final_message = await stream.get_final_message()
-                response_preview = {"role": "assistant", "content": final_message.content}
+            final_message = None
+            for attempt in range(1, self._llm_max_retries + 1):
+                tool_requests = []
+                block_types = {}
+                had_events = False
                 try:
-                    response_dump = json.dumps(response_preview, default=str)
-                except TypeError:
-                    response_dump = str(response_preview)
-                logger.info(
-                    "Received response from Anthropic (counts toward output tokens; preview truncated): %s",
-                    response_dump[:5000],
+                    async with self.client.messages.stream(**request_kwargs) as stream:
+                        async for event in stream:
+                            had_events = True
+                            if event.type == "content_block_start":
+                                block_types[event.index] = getattr(event.content_block, "type", None)
+                                if block_types.get(event.index) == "thinking" and stream_mode:
+                                    yield {"delta": {"content": "**Thoughts:**\n"}}
+                            if event.type == "content_block_delta":
+                                # Anthropic thinking deltas may not always use type="text_delta"; look for a text attribute.
+                                delta_text = getattr(event.delta, "text", None) or ""
+                                if not delta_text and hasattr(event.delta, "thinking"):
+                                    delta_text = getattr(event.delta, "thinking") or ""
+                                if delta_text:
+                                    block_type = block_types.get(event.index)
+                                    is_thinking = (
+                                        block_type == "thinking"
+                                        or hasattr(event.delta, "thinking")
+                                        or getattr(event.delta, "type", None) == "thinking_delta"
+                                    )
+                                    if is_thinking:
+                                        thinking_parts.append(delta_text)
+                                        if stream_mode:
+                                            yield {"delta": {"thinking": delta_text, "content": delta_text}}
+                                    else:
+                                        if stream_mode:
+                                            yield {"delta": {"content": delta_text}}
+                            if event.type == "content_block_stop" and stream_mode:
+                                if block_types.get(event.index) == "thinking":
+                                    yield {"delta": {"content": "\n\n---\n\n"}}
+                                yield {"delta": {"content": "\n"}}
+                                
+                            if event.type == "content_block_stop" and getattr(event.content_block, "type", None) == "tool_use":
+                                tool_requests.append(event.content_block)
+                                if stream_mode:
+                                    tool_call = {
+                                        "id": event.content_block.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": event.content_block.name,
+                                            "arguments": json.dumps(event.content_block.input or {}),
+                                        },
+                                    }
+                                    yield {"delta": {"tool_calls": [tool_call]}}
+
+                        final_message = await stream.get_final_message()
+                        break
+                except Exception as exc:
+                    if not self._is_llm_connection_error(exc):
+                        raise
+                    logger.warning(
+                        "LLM connection failed (attempt %d/%d): %s",
+                        attempt,
+                        self._llm_max_retries,
+                        exc,
+                    )
+                    if attempt < self._llm_max_retries and not had_events:
+                        if self._llm_retry_backoff_seconds:
+                            await asyncio.sleep(self._llm_retry_backoff_seconds * attempt)
+                        continue
+                    message = (
+                        "Unable to connect to the LLM provider. "
+                        "Please check your network connectivity and try again."
+                    )
+                    if stream_mode:
+                        yield {"delta": {"content": message}}
+                        yield {"delta": {}, "finish_reason": "stop"}
+                    else:
+                        yield message
+                    return
+
+            if final_message is None:
+                message = (
+                    "Unable to connect to the LLM provider. "
+                    "Please check your network connectivity and try again."
                 )
-                usage = getattr(final_message, "usage", None)
-                if usage:
-                    input_tokens = getattr(usage, "input_tokens", None)
-                    output_tokens = getattr(usage, "output_tokens", None)
-                    total_tokens = (
-                        input_tokens + output_tokens
-                        if input_tokens is not None and output_tokens is not None
-                        else None
-                    )
-                    logger.info(
-                        "Token usage: input=%s output=%s total=%s cache_creation_input=%s cache_read_input=%s",
-                        input_tokens,
-                        output_tokens,
-                        total_tokens,
-                        getattr(usage, "cache_creation_input_tokens", None),
-                        getattr(usage, "cache_read_input_tokens", None),
-                    )
-                conversation.append({"role": "assistant", "content": final_message.content})
+                if stream_mode:
+                    yield {"delta": {"content": message}}
+                    yield {"delta": {}, "finish_reason": "stop"}
+                else:
+                    yield message
+                return
 
-                text_blocks = [
-                    block.text
-                    for block in final_message.content
-                    if getattr(block, "text", None) and getattr(block, "type", None) != "thinking"
-                ]
-                for text in text_blocks:
-                    answer_parts.append(text)
-                thinking_blocks = [
-                    block.text
-                    for block in final_message.content
-                    if getattr(block, "text", None) and getattr(block, "type", None) == "thinking"
-                ]
-                thinking_parts.extend(thinking_blocks)
+            response_preview = {"role": "assistant", "content": final_message.content}
+            try:
+                response_dump = json.dumps(response_preview, default=str)
+            except TypeError:
+                response_dump = str(response_preview)
+            logger.info(
+                "Received response from Anthropic (counts toward output tokens; preview truncated): %s",
+                response_dump[:5000],
+            )
+            usage = getattr(final_message, "usage", None)
+            if usage:
+                input_tokens = getattr(usage, "input_tokens", None)
+                output_tokens = getattr(usage, "output_tokens", None)
+                total_tokens = (
+                    input_tokens + output_tokens
+                    if input_tokens is not None and output_tokens is not None
+                    else None
+                )
+                logger.info(
+                    "Token usage: input=%s output=%s total=%s cache_creation_input=%s cache_read_input=%s",
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    getattr(usage, "cache_creation_input_tokens", None),
+                    getattr(usage, "cache_read_input_tokens", None),
+                )
+            conversation.append({"role": "assistant", "content": final_message.content})
 
-                if not tool_requests:
-                    break
+            text_blocks = [
+                block.text
+                for block in final_message.content
+                if getattr(block, "text", None) and getattr(block, "type", None) != "thinking"
+            ]
+            for text in text_blocks:
+                answer_parts.append(text)
+            thinking_blocks = [
+                block.text
+                for block in final_message.content
+                if getattr(block, "text", None) and getattr(block, "type", None) == "thinking"
+            ]
+            thinking_parts.extend(thinking_blocks)
+
+            if not tool_requests:
+                break
 
             tool_results: List[ToolResultBlockParam] = []
             for tool_use in tool_requests:
