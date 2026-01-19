@@ -51,7 +51,10 @@ def sse_chat_completions(
 
 
 def chat_completion_response(
-    chunk_iterable: Sequence[Any], model: str, prompt_messages: Sequence[str]
+    chunk_iterable: Sequence[Any],
+    model: str,
+    prompt_messages: Sequence[str],
+    model_info: Any = None,
 ) -> dict:
     """Return a one-shot JSON response matching the OpenAI API shape."""
     if all(isinstance(chunk, str) for chunk in chunk_iterable):
@@ -66,11 +69,6 @@ def chat_completion_response(
     payload = _base_payload(model)
     payload.update(
         {
-            "usage": {
-                "prompt_tokens": None,
-                "completion_tokens": None,
-                "total_tokens": None,
-            },
             "choices": [
                 {
                     "index": 0,
@@ -81,6 +79,8 @@ def chat_completion_response(
             ],
         }
     )
+    if model_info is not None:
+        payload["model_info"] = model_info
     return payload
 
 
@@ -102,13 +102,17 @@ async def async_sse_chat_completions(
             choice["delta"] = delta if delta is not None else {}
             if "finish_reason" in chunk:
                 choice["finish_reason"] = chunk.get("finish_reason")
+            model_info = chunk.get("model_info")
         else:
             choice["delta"] = {"content": _delta_content(chunk)}
+            model_info = None
 
         payload = {
             **base,
             "object": "chat.completion.chunk",
             "choices": [choice],
         }
+        if model_info is not None:
+            payload["model_info"] = model_info
         yield f"data: {json.dumps(payload)}\n\n"
     yield "data: [DONE]\n\n"

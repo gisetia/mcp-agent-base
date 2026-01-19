@@ -27,6 +27,7 @@ class ChatCompletionRequest(BaseModel):
     messages: List[Message]
     stream: bool = True
     simulate: Optional[bool] = None
+    include_model_info: bool = False
 
 
 def _extract_user_question(messages: List[Message]) -> Optional[str]:
@@ -54,19 +55,27 @@ async def chat_completions(chat_request: ChatCompletionRequest):
     agent = ClaudeMCPAgent(simulate=SIMULATE if chat_request.simulate is None else chat_request.simulate)
 
     if chat_request.stream:
-        stream = agent.ask_stream(conversation)
+        stream = agent.ask_stream(
+            conversation,
+            include_model_info=chat_request.include_model_info,
+        )
         response = StreamingResponse(
             async_sse_chat_completions(stream, agent.model),
             media_type="text/event-stream",
         )
         return response
 
-    answer = await agent.ask(conversation)
+    if chat_request.include_model_info:
+        answer, model_info = await agent.ask_with_model_info(conversation)
+    else:
+        answer = await agent.ask(conversation)
+        model_info = None
 
     payload = chat_completion_response(
         chunk_iterable=[answer],
         model=agent.model,
         prompt_messages=[message.content for message in chat_request.messages],
+        model_info=model_info,
     )
 
     return JSONResponse(payload)

@@ -102,6 +102,7 @@ class ClaudeMCPAgent:
             self.mcp_client = MCPClient(mcp_server_url)
         self._llm_max_retries = max(1, llm_max_retries)
         self._llm_retry_backoff_seconds = max(0.0, llm_retry_backoff_seconds)
+        self._last_model_info: Optional[Dict[str, Any]] = None
 
     def _is_llm_connection_error(self, exc: BaseException) -> bool:
         for err in _iter_exceptions(exc):
@@ -133,11 +134,13 @@ class ClaudeMCPAgent:
         *,
         stream_mode: bool = True,
         include_tool_logs: bool = INCLUDE_TOOL_LOGS,
+        include_model_info: bool = False,
     ) -> AsyncIterable[Any]:
         """Yield intermediate and final responses while invoking MCP tools.
 
         stream_mode=True streams live pieces; stream_mode=False emits only final pieces in order.
         """
+        self._last_model_info = None
         if self.simulate:
             simulated = "Simulated response."
             if stream_mode:
@@ -172,6 +175,17 @@ class ClaudeMCPAgent:
         conversation: List[MessageParam] = list(messages)
         answer_parts: List[str] = []
         thinking_parts: List[str] = []
+        usage_totals = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
+        saw_usage = False
+        saw_input_tokens = False
+        saw_output_tokens = False
+        saw_cache_creation_tokens = False
+        saw_cache_read_tokens = False
 
         while True:
             block_types: Dict[int, str] = {}
@@ -307,6 +321,21 @@ class ClaudeMCPAgent:
             if usage:
                 input_tokens = getattr(usage, "input_tokens", None)
                 output_tokens = getattr(usage, "output_tokens", None)
+                saw_usage = True
+                if input_tokens is not None:
+                    usage_totals["input_tokens"] += input_tokens
+                    saw_input_tokens = True
+                if output_tokens is not None:
+                    usage_totals["output_tokens"] += output_tokens
+                    saw_output_tokens = True
+                cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", None)
+                if cache_creation_tokens is not None:
+                    usage_totals["cache_creation_input_tokens"] += cache_creation_tokens
+                    saw_cache_creation_tokens = True
+                cache_read_tokens = getattr(usage, "cache_read_input_tokens", None)
+                if cache_read_tokens is not None:
+                    usage_totals["cache_read_input_tokens"] += cache_read_tokens
+                    saw_cache_read_tokens = True
                 total_tokens = (
                     input_tokens + output_tokens
                     if input_tokens is not None and output_tokens is not None
@@ -317,8 +346,8 @@ class ClaudeMCPAgent:
                     input_tokens,
                     output_tokens,
                     total_tokens,
-                    getattr(usage, "cache_creation_input_tokens", None),
-                    getattr(usage, "cache_read_input_tokens", None),
+                    cache_creation_tokens,
+                    cache_read_tokens,
                 )
             conversation.append({"role": "assistant", "content": final_message.content})
 
@@ -409,6 +438,38 @@ class ClaudeMCPAgent:
             conversation.append({"role": "user", "content": tool_results})
 
         # Append collected pieces.
+        if saw_usage:
+            usage_summary: Dict[str, Optional[int]] = {
+                "input_tokens": usage_totals["input_tokens"] if saw_input_tokens else None,
+                "output_tokens": usage_totals["output_tokens"] if saw_output_tokens else None,
+                "total_tokens": (
+                    usage_totals["input_tokens"] + usage_totals["output_tokens"]
+                    if saw_input_tokens and saw_output_tokens
+                    else None
+                ),
+                "cache_creation_input_tokens": (
+                    usage_totals["cache_creation_input_tokens"]
+                    if saw_cache_creation_tokens
+                    else None
+                ),
+                "cache_read_input_tokens": (
+                    usage_totals["cache_read_input_tokens"] if saw_cache_read_tokens else None
+                ),
+            }
+        else:
+            usage_summary = None
+        model_info = None
+        if include_model_info:
+            model_info = {
+                "model": self.model,
+                "temperature": self.temperature,
+                "max_output_tokens": self.max_output_tokens,
+                "thinking_enabled": self.thinking_enabled,
+                "thinking_budget_tokens": self.thinking_budget_tokens,
+                "usage": usage_summary,
+            }
+        self._last_model_info = model_info
+
         final_sections = []
         if thinking_parts:
             final_sections.append(f"**Thoughts:**\n\n{''.join(thinking_parts)}\n\n---\n\n**Answer:**\n\n")
@@ -416,7 +477,10 @@ class ClaudeMCPAgent:
         final_sections.extend([part for part in answer_parts if part])
         final_answer = "\n\n".join(final_sections).strip()
         if stream_mode:
-            yield {"delta": {}, "finish_reason": "stop"}
+            chunk = {"delta": {}, "finish_reason": "stop"}
+            if include_model_info:
+                chunk["model_info"] = model_info
+            yield chunk
         else:
             yield final_answer
 
@@ -432,6 +496,21 @@ class ClaudeMCPAgent:
         ):
             parts.append(str(chunk))
         return "".join(parts).strip()
+
+    async def ask_with_model_info(
+        self,
+        messages: List[MessageParam],
+    ) -> tuple[str, Optional[Dict[str, Any]]]:
+        """Return the final answer plus aggregated model info from the full exchange."""
+        parts: List[str] = []
+        async for chunk in self.ask_stream(
+            messages,
+            stream_mode=False,
+            include_model_info=True,
+        ):
+            parts.append(str(chunk))
+        answer = "".join(parts).strip()
+        return answer, self._last_model_info
 
     @staticmethod
     def _normalize_model(model: str) -> str:
