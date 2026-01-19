@@ -10,7 +10,7 @@ from typing import AsyncIterable, List, Optional, Any, Dict
 from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam, ToolResultBlockParam
 
-from .mcp_client import MCPClient, EmptyMCPClient
+from .mcp_client import MCPClient, EmptyMCPClient, MCPConnectionError
 from .settings import (
     MCP_SERVER_URL,
     DEFAULT_MODEL,
@@ -103,7 +103,20 @@ class ClaudeMCPAgent:
                 "mcp_server": self.mcp_client.server_url if self.mcp_client else "<simulation>",
             },
         )
-        tools = [tool.to_anthropic() for tool in await self.mcp_client.list_tools()]
+        try:
+            tools = [tool.to_anthropic() for tool in await self.mcp_client.list_tools()]
+        except MCPConnectionError as exc:
+            logger.warning("MCP connection failed during tool discovery: %s", exc)
+            message = (
+                f"Unable to connect to the MCP server at {self.mcp_client.server_url}. "
+                "Please check that it is running and try again."
+            )
+            if stream_mode:
+                yield {"delta": {"content": message}}
+                yield {"delta": {}, "finish_reason": "stop"}
+            else:
+                yield message
+            return
 
         conversation: List[MessageParam] = list(messages)
         answer_parts: List[str] = []
@@ -245,9 +258,27 @@ class ClaudeMCPAgent:
                 if include_tool_logs:
                     answer_parts.append(f"\n\nCalling `{tool_use.name}` with args:\n```json\n{json.dumps(tool_use.input or {}, indent=2)}\n```")
                 
-                tool_output = await self.mcp_client.call_tool(
-                    tool_name=tool_use.name, arguments=tool_use.input or {}
-                )
+                try:
+                    tool_output = await self.mcp_client.call_tool(
+                        tool_name=tool_use.name, arguments=tool_use.input or {}
+                    )
+                except MCPConnectionError as exc:
+                    logger.warning(
+                        "MCP connection failed while calling tool %s: %s",
+                        tool_use.name,
+                        exc,
+                    )
+                    message = (
+                        f"Unable to connect to the MCP server at {self.mcp_client.server_url} "
+                        f"while calling `{tool_use.name}`. Please check that it is running "
+                        "and try again."
+                    )
+                    if stream_mode:
+                        yield {"delta": {"content": message}}
+                        yield {"delta": {}, "finish_reason": "stop"}
+                    else:
+                        yield message
+                    return
 
                 try:
                     parsed_tool_output = json.loads(tool_output)

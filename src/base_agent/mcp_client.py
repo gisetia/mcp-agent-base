@@ -2,11 +2,31 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Awaitable, Callable, Dict, List
 
 from .settings import CLIENT_NAME
+
+try:  # Optional dependency; used only for more specific error detection.
+    import httpcore  # type: ignore
+    import httpx  # type: ignore
+except Exception:  # pragma: no cover - fallback if httpx isn't available
+    httpcore = None
+    httpx = None
+
+
+class MCPConnectionError(RuntimeError):
+    """Raised when the MCP server cannot be reached after retries."""
+
+
+def _iter_exceptions(exc: BaseException):
+    if isinstance(exc, BaseExceptionGroup):
+        for nested in exc.exceptions:
+            yield from _iter_exceptions(nested)
+    else:
+        yield exc
 
 
 @dataclass
@@ -27,8 +47,10 @@ class MCPToolDefinition:
 class MCPClient:
     """Wrapper around the MCP SSE client."""
 
-    def __init__(self, server_url: str):
+    def __init__(self, server_url: str, max_retries: int = 3, retry_backoff_seconds: float = 0.5):
         self.server_url = server_url
+        self._max_retries = max(1, max_retries)
+        self._retry_backoff_seconds = max(0.0, retry_backoff_seconds)
         try:
             from mcp.client.session import ClientSession  # type: ignore
             from mcp.client.streamable_http import streamablehttp_client  # type: ignore
@@ -42,6 +64,32 @@ class MCPClient:
         self._ClientSession = ClientSession
         self._transport_client = streamablehttp_client
         self._types = types
+
+    def _is_connection_error(self, exc: BaseException) -> bool:
+        for err in _iter_exceptions(exc):
+            if isinstance(err, (ConnectionError, TimeoutError)):
+                return True
+            if httpx is not None and isinstance(err, httpx.ConnectError):
+                return True
+            if httpcore is not None and isinstance(err, httpcore.ConnectError):
+                return True
+        return False
+
+    async def _with_retries(self, action: str, func: Callable[[], Awaitable[Any]]) -> Any:
+        last_exc: BaseException | None = None
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                return await func()
+            except Exception as exc:
+                if not self._is_connection_error(exc):
+                    raise
+                last_exc = exc
+                if attempt < self._max_retries and self._retry_backoff_seconds:
+                    await asyncio.sleep(self._retry_backoff_seconds * attempt)
+        raise MCPConnectionError(
+            f"Failed to {action} from MCP server at {self.server_url} "
+            f"after {self._max_retries} attempts."
+        ) from last_exc
 
     @asynccontextmanager
     async def _session(self):
@@ -60,37 +108,43 @@ class MCPClient:
 
     async def list_tools(self) -> List[MCPToolDefinition]:
         """Return the tool definitions exposed by the MCP server."""
-        async with self._session() as session:
-            response = await session.list_tools()
-            tools = []
-            for tool in response.tools:
-                # The MCP types use camelCase; Anthropic expects snake_case.
-                input_schema = getattr(tool, "inputSchema", None) or getattr(
-                    tool, "input_schema", None
-                )
-                if input_schema is None:
-                    input_schema = {"type": "object"}
-                tools.append(
-                    MCPToolDefinition(
-                        name=tool.name,
-                        description=tool.description or "",
-                        input_schema=input_schema,
+        async def _fetch() -> List[MCPToolDefinition]:
+            async with self._session() as session:
+                response = await session.list_tools()
+                tools = []
+                for tool in response.tools:
+                    # The MCP types use camelCase; Anthropic expects snake_case.
+                    input_schema = getattr(tool, "inputSchema", None) or getattr(
+                        tool, "input_schema", None
                     )
-                )
-            return tools
+                    if input_schema is None:
+                        input_schema = {"type": "object"}
+                    tools.append(
+                        MCPToolDefinition(
+                            name=tool.name,
+                            description=tool.description or "",
+                            input_schema=input_schema,
+                        )
+                    )
+                return tools
+
+        return await self._with_retries("list tools", _fetch)
 
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """Invoke a specific tool and return a readable string result."""
-        async with self._session() as session:
-            response = await session.call_tool(tool_name, arguments)
-            # Collect text content; fall back to a repr if necessary.
-            rendered: List[str] = []
-            for item in response.content:
-                text = getattr(item, "text", None) or getattr(item, "data", None)
-                if text is None:
-                    text = str(item)
-                rendered.append(text)
-            return "\n".join(rendered)
+        async def _call() -> str:
+            async with self._session() as session:
+                response = await session.call_tool(tool_name, arguments)
+                # Collect text content; fall back to a repr if necessary.
+                rendered: List[str] = []
+                for item in response.content:
+                    text = getattr(item, "text", None) or getattr(item, "data", None)
+                    if text is None:
+                        text = str(item)
+                    rendered.append(text)
+                return "\n".join(rendered)
+
+        return await self._with_retries(f"call tool '{tool_name}'", _call)
 
 
 class EmptyMCPClient:
